@@ -37,7 +37,6 @@ if not REX_API_KEY:
 
 logger.info(f"Rate limit: {RATE_LIMIT}")
 
-
 # -----------------------------
 # FastAPI app
 # -----------------------------
@@ -54,7 +53,14 @@ app.add_middleware(
 # -----------------------------
 # Rate limiting
 # -----------------------------
-limiter = Limiter(key_func=get_remote_address)
+# Optional improvement: Render is behind a proxy; this helps get the real client IP.
+def client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return get_remote_address(request)
+
+limiter = Limiter(key_func=client_ip)
 app.state.limiter = limiter
 
 @app.exception_handler(RateLimitExceeded)
@@ -75,6 +81,23 @@ engine = create_engine(
     pool_pre_ping=True,
     pool_recycle=300,
 )
+
+# -----------------------------
+# Health endpoints (Step 2)
+# -----------------------------
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "supabase-sql-api"}
+
+@app.get("/dbcheck")
+async def dbcheck():
+    try:
+        with engine.connect() as conn:
+            val = conn.execute(text("SELECT 1")).scalar()
+        return {"db": "ok", "result": val}
+    except Exception:
+        logger.exception("DB health check failed")
+        raise HTTPException(status_code=500, detail="Database connection failed")
 
 # -----------------------------
 # Safety: allow ONLY SELECT
@@ -114,7 +137,7 @@ def add_limit_if_needed(sql: str, limit: int = 100) -> str:
     return f"{s} LIMIT {limit}"
 
 # -----------------------------
-# Endpoint
+# Main Endpoint
 # -----------------------------
 @app.get("/sqlquery_alchemy/")
 @limiter.limit(RATE_LIMIT)
@@ -138,16 +161,16 @@ async def sqlquery_alchemy(
 
     try:
         with engine.connect() as conn:
-            # No manual BEGIN/COMMIT here (pooler-friendly)
             result = conn.execute(text(safe_sql))
             rows = result.fetchall()
             cols = list(result.keys())
 
         return [dict(zip(cols, row)) for row in rows]
 
-    except SQLAlchemyError as e:
+    except SQLAlchemyError:
         logger.exception("Database error")
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
+        # safer: don't leak internal connection strings/errors to callers
+        raise HTTPException(status_code=500, detail="Database error")
+    except Exception:
         logger.exception("Unexpected error")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Unexpected error")
