@@ -38,12 +38,6 @@ if not REX_API_KEY:
 
 logger.info(f"Rate limit: {RATE_LIMIT}")
 
-# -----------------------------
-# 🔍 DB DEBUG
-# -----------------------------
-u = urlparse(DATABASE_URL)
-user = u.netloc.split("@")[0].split(":")[0] if "@" in u.netloc else ""
-logger.info(f"DB_DEBUG host={u.hostname} port={u.port} user={user}")
 
 # -----------------------------
 # FastAPI app
