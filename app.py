@@ -39,14 +39,11 @@ if not REX_API_KEY:
 logger.info(f"Rate limit: {RATE_LIMIT}")
 
 # -----------------------------
-# 🔍 DB DEBUG (CRITICAL)
+# 🔍 DB DEBUG
 # -----------------------------
 u = urlparse(DATABASE_URL)
 user = u.netloc.split("@")[0].split(":")[0] if "@" in u.netloc else ""
-
-logger.info(
-    f"DB_DEBUG host={u.hostname} port={u.port} user={user}"
-)
+logger.info(f"DB_DEBUG host={u.hostname} port={u.port} user={user}")
 
 # -----------------------------
 # FastAPI app
@@ -78,7 +75,7 @@ async def custom_rate_limit_handler(
     )
 
 # -----------------------------
-# DB Engine (read-only intent)
+# DB Engine
 # -----------------------------
 engine = create_engine(
     DATABASE_URL,
@@ -103,6 +100,7 @@ def is_select_only(sql: str) -> bool:
     s = sql.strip()
     if not s.lower().startswith("select"):
         return False
+    # block multi-statement; allow a single trailing ';'
     if ";" in s[:-1]:
         return False
     if DANGEROUS.search(s):
@@ -112,9 +110,11 @@ def is_select_only(sql: str) -> bool:
 def add_limit_if_needed(sql: str, limit: int = 100) -> str:
     s = sql.strip().rstrip(";")
 
+    # don't force LIMIT on aggregations
     if AGG_HINT.search(s):
         return s
 
+    # already has LIMIT
     if re.search(r"\blimit\b", s, flags=re.IGNORECASE):
         return s
 
@@ -145,14 +145,10 @@ async def sqlquery_alchemy(
 
     try:
         with engine.connect() as conn:
-            conn.exec_driver_sql("BEGIN")
-            conn.exec_driver_sql("SET TRANSACTION READ ONLY")
-
+            # No manual BEGIN/COMMIT here (pooler-friendly)
             result = conn.execute(text(safe_sql))
             rows = result.fetchall()
             cols = list(result.keys())
-
-            conn.exec_driver_sql("COMMIT")
 
         return [dict(zip(cols, row)) for row in rows]
 
