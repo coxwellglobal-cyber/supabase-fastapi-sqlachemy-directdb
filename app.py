@@ -2,6 +2,7 @@ import os
 import re
 import logging
 from typing import Any, List, Dict
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
@@ -24,9 +25,9 @@ logging.basicConfig(
 logger = logging.getLogger("supabase-api")
 
 # -----------------------------
-# Env vars (Render will inject these)
+# Env vars (Render injects these)
 # -----------------------------
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 REX_API_KEY = os.getenv("REX_API_KEY")
 RATE_LIMIT = os.getenv("RATE_LIMIT", "100/hour")
 
@@ -36,6 +37,16 @@ if not REX_API_KEY:
     raise ValueError("REX_API_KEY environment variable is required")
 
 logger.info(f"Rate limit: {RATE_LIMIT}")
+
+# -----------------------------
+# 🔍 DB DEBUG (CRITICAL)
+# -----------------------------
+u = urlparse(DATABASE_URL)
+user = u.netloc.split("@")[0].split(":")[0] if "@" in u.netloc else ""
+
+logger.info(
+    f"DB_DEBUG host={u.hostname} port={u.port} user={user}"
+)
 
 # -----------------------------
 # FastAPI app
@@ -57,14 +68,17 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 
 @app.exception_handler(RateLimitExceeded)
-async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+async def custom_rate_limit_handler(
+    request: Request,
+    exc: RateLimitExceeded
+) -> JSONResponse:
     return JSONResponse(
         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
         content={"detail": "Rate limit exceeded. Please try again later."}
     )
 
 # -----------------------------
-# DB Engine (read-only behavior enforced at query level too)
+# DB Engine (read-only intent)
 # -----------------------------
 engine = create_engine(
     DATABASE_URL,
@@ -73,20 +87,22 @@ engine = create_engine(
 )
 
 # -----------------------------
-# Safety: allow ONLY SELECT, block multi-statement, block dangerous keywords
+# Safety: allow ONLY SELECT
 # -----------------------------
 DANGEROUS = re.compile(
     r"\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|vacuum|analyze)\b",
     re.IGNORECASE
 )
 
-AGG_HINT = re.compile(r"\b(group\s+by|having|count\s*\(|sum\s*\(|avg\s*\(|min\s*\(|max\s*\()\b", re.IGNORECASE)
+AGG_HINT = re.compile(
+    r"\b(group\s+by|having|count\s*\(|sum\s*\(|avg\s*\(|min\s*\(|max\s*\()\b",
+    re.IGNORECASE
+)
 
 def is_select_only(sql: str) -> bool:
     s = sql.strip()
     if not s.lower().startswith("select"):
         return False
-    # block multi statement with semicolon (allow trailing ;)
     if ";" in s[:-1]:
         return False
     if DANGEROUS.search(s):
@@ -94,18 +110,11 @@ def is_select_only(sql: str) -> bool:
     return True
 
 def add_limit_if_needed(sql: str, limit: int = 100) -> str:
-    """
-    Your Custom GPT will already add LIMIT 100 when needed,
-    but this makes the API safer.
-    If query looks like aggregation (GROUP BY / HAVING / COUNT / SUM etc),
-    we do NOT force LIMIT (as per your rule).
-    """
     s = sql.strip().rstrip(";")
 
     if AGG_HINT.search(s):
-        return s  # do not enforce LIMIT for aggregation queries
+        return s
 
-    # If already has LIMIT, keep as-is
     if re.search(r"\blimit\b", s, flags=re.IGNORECASE):
         return s
 
@@ -116,7 +125,12 @@ def add_limit_if_needed(sql: str, limit: int = 100) -> str:
 # -----------------------------
 @app.get("/sqlquery_alchemy/")
 @limiter.limit(RATE_LIMIT)
-async def sqlquery_alchemy(sqlquery: str, api_key: str, request: Request) -> Any:
+async def sqlquery_alchemy(
+    sqlquery: str,
+    api_key: str,
+    request: Request
+) -> Any:
+
     if api_key != REX_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
@@ -131,7 +145,6 @@ async def sqlquery_alchemy(sqlquery: str, api_key: str, request: Request) -> Any
 
     try:
         with engine.connect() as conn:
-            # Force read-only transaction at DB level
             conn.exec_driver_sql("BEGIN")
             conn.exec_driver_sql("SET TRANSACTION READ ONLY")
 
@@ -141,12 +154,11 @@ async def sqlquery_alchemy(sqlquery: str, api_key: str, request: Request) -> Any
 
             conn.exec_driver_sql("COMMIT")
 
-        data: List[Dict[str, Any]] = [dict(zip(cols, row)) for row in rows]
-        return data
+        return [dict(zip(cols, row)) for row in rows]
 
     except SQLAlchemyError as e:
         logger.exception("Database error")
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         logger.exception("Unexpected error")
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
