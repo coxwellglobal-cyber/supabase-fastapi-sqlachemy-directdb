@@ -84,6 +84,11 @@ async def custom_rate_limit_exceeded_handler(request: Request, exc: RateLimitExc
 app.add_exception_handler(RateLimitExceeded, custom_rate_limit_exceeded_handler)
 
 # Create SQLAlchemy engine
+from urllib.parse import urlparse
+
+u = urlparse(DATABASE_URL)
+print("DB_DEBUG host:", u.hostname, "port:", u.port, "user:", u.username)
+
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 # Ensure all SQLAlchemy connections are session-level read-only
