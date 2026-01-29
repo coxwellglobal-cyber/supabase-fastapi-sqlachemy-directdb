@@ -2,7 +2,6 @@ import os
 import re
 import logging
 from typing import Any, List, Dict
-from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
