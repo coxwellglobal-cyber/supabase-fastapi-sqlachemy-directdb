@@ -2,6 +2,7 @@ import os
 import re
 import logging
 from typing import Any, List, Dict
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
@@ -9,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.engine import make_url  # ✅ for DB_URL_CHECK
 
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -38,6 +40,25 @@ if not REX_API_KEY:
 logger.info(f"Rate limit: {RATE_LIMIT}")
 
 # -----------------------------
+# 🔍 DB DEBUG (simple parse)
+# -----------------------------
+u = urlparse(DATABASE_URL)
+user_simple = u.netloc.split("@")[0].split(":")[0] if "@" in u.netloc else ""
+logger.info(f"DB_DEBUG host={u.hostname} port={u.port} user={user_simple}")
+
+# -----------------------------
+# 🔍 DB_URL_CHECK (SQLAlchemy real parse)
+# -----------------------------
+try:
+    url_obj = make_url(DATABASE_URL)
+    logger.info(
+        f"DB_URL_CHECK driver={url_obj.drivername} host={url_obj.host} "
+        f"port={url_obj.port} db={url_obj.database} user={url_obj.username}"
+    )
+except Exception as e:
+    logger.error(f"DB_URL_CHECK parse failed: {e}")
+
+# -----------------------------
 # FastAPI app
 # -----------------------------
 app = FastAPI(title="Coxwell Supabase Read-only SQL API")
@@ -53,7 +74,6 @@ app.add_middleware(
 # -----------------------------
 # Rate limiting
 # -----------------------------
-# Optional improvement: Render is behind a proxy; this helps get the real client IP.
 def client_ip(request: Request) -> str:
     xff = request.headers.get("x-forwarded-for")
     if xff:
@@ -91,13 +111,17 @@ async def health():
 
 @app.get("/dbcheck")
 async def dbcheck():
-    try:
-        with engine.connect() as conn:
-            val = conn.execute(text("SELECT 1")).scalar()
-        return {"db": "ok", "result": val}
-    except Exception:
-        logger.exception("DB health check failed")
-        raise HTTPException(status_code=500, detail="Database connection failed")
+    # retry twice (helps Render cold starts)
+    for _ in range(2):
+        try:
+            with engine.connect() as conn:
+                val = conn.execute(text("SELECT 1")).scalar()
+            return {"db": "ok", "result": val}
+        except Exception:
+            pass
+
+    logger.exception("DB health check failed")
+    raise HTTPException(status_code=500, detail="Database connection failed")
 
 # -----------------------------
 # Safety: allow ONLY SELECT
@@ -169,7 +193,6 @@ async def sqlquery_alchemy(
 
     except SQLAlchemyError:
         logger.exception("Database error")
-        # safer: don't leak internal connection strings/errors to callers
         raise HTTPException(status_code=500, detail="Database error")
     except Exception:
         logger.exception("Unexpected error")
