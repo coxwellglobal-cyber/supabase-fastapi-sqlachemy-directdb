@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.engine import make_url  # ✅ for DB_URL_CHECK
+from sqlalchemy.engine import make_url
 
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -40,15 +40,12 @@ if not REX_API_KEY:
 logger.info(f"Rate limit: {RATE_LIMIT}")
 
 # -----------------------------
-# 🔍 DB DEBUG (simple parse)
+# DB Debug (safe)
 # -----------------------------
 u = urlparse(DATABASE_URL)
 user_simple = u.netloc.split("@")[0].split(":")[0] if "@" in u.netloc else ""
 logger.info(f"DB_DEBUG host={u.hostname} port={u.port} user={user_simple}")
 
-# -----------------------------
-# 🔍 DB_URL_CHECK (SQLAlchemy real parse)
-# -----------------------------
 try:
     url_obj = make_url(DATABASE_URL)
     logger.info(
@@ -84,17 +81,14 @@ limiter = Limiter(key_func=client_ip)
 app.state.limiter = limiter
 
 @app.exception_handler(RateLimitExceeded)
-async def custom_rate_limit_handler(
-    request: Request,
-    exc: RateLimitExceeded
-) -> JSONResponse:
+async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
     return JSONResponse(
         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
         content={"detail": "Rate limit exceeded. Please try again later."}
     )
 
 # -----------------------------
-# DB Engine
+# DB Engine (pooler-friendly)
 # -----------------------------
 engine = create_engine(
     DATABASE_URL,
@@ -103,25 +97,23 @@ engine = create_engine(
 )
 
 # -----------------------------
-# Health endpoints (Step 2)
+# Health endpoints
 # -----------------------------
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "supabase-sql-api"}
 
+# TEMP DEBUG VERSION: returns real DB error in response
 @app.get("/dbcheck")
 async def dbcheck():
-    # retry twice (helps Render cold starts)
-    for _ in range(2):
-        try:
-            with engine.connect() as conn:
-                val = conn.execute(text("SELECT 1")).scalar()
-            return {"db": "ok", "result": val}
-        except Exception:
-            pass
-
-    logger.exception("DB health check failed")
-    raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        with engine.connect() as conn:
+            val = conn.execute(text("SELECT 1")).scalar()
+        return {"db": "ok", "result": val}
+    except Exception as e:
+        logger.exception("DB health check failed")
+        # TEMP: show real reason in browser (remove after fix)
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {repr(e)}")
 
 # -----------------------------
 # Safety: allow ONLY SELECT
@@ -149,36 +141,23 @@ def is_select_only(sql: str) -> bool:
 
 def add_limit_if_needed(sql: str, limit: int = 100) -> str:
     s = sql.strip().rstrip(";")
-
-    # don't force LIMIT on aggregations
     if AGG_HINT.search(s):
         return s
-
-    # already has LIMIT
     if re.search(r"\blimit\b", s, flags=re.IGNORECASE):
         return s
-
     return f"{s} LIMIT {limit}"
 
 # -----------------------------
-# Main Endpoint
+# Main SQL endpoint
 # -----------------------------
 @app.get("/sqlquery_alchemy/")
 @limiter.limit(RATE_LIMIT)
-async def sqlquery_alchemy(
-    sqlquery: str,
-    api_key: str,
-    request: Request
-) -> Any:
-
+async def sqlquery_alchemy(sqlquery: str, api_key: str, request: Request) -> Any:
     if api_key != REX_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     if not is_select_only(sqlquery):
-        raise HTTPException(
-            status_code=400,
-            detail="Only single-statement SELECT queries are allowed."
-        )
+        raise HTTPException(status_code=400, detail="Only single-statement SELECT queries are allowed.")
 
     safe_sql = add_limit_if_needed(sqlquery, limit=100)
     logger.info(f"Query: {safe_sql}")
