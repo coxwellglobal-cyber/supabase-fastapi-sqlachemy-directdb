@@ -2,7 +2,6 @@ import os
 import re
 import logging
 from typing import Any, List, Dict
-from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
@@ -10,7 +9,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.engine import make_url
 
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -21,15 +19,15 @@ from slowapi.errors import RateLimitExceeded
 # -----------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("supabase-api")
 
 # -----------------------------
 # Env vars (Render injects these)
 # -----------------------------
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-REX_API_KEY = os.getenv("REX_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+REX_API_KEY = os.getenv("REX_API_KEY", "")
 RATE_LIMIT = os.getenv("RATE_LIMIT", "100/hour")
 
 if not DATABASE_URL:
@@ -40,29 +38,13 @@ if not REX_API_KEY:
 logger.info(f"Rate limit: {RATE_LIMIT}")
 
 # -----------------------------
-# DB Debug (safe)
-# -----------------------------
-u = urlparse(DATABASE_URL)
-user_simple = u.netloc.split("@")[0].split(":")[0] if "@" in u.netloc else ""
-logger.info(f"DB_DEBUG host={u.hostname} port={u.port} user={user_simple}")
-
-try:
-    url_obj = make_url(DATABASE_URL)
-    logger.info(
-        f"DB_URL_CHECK driver={url_obj.drivername} host={url_obj.host} "
-        f"port={url_obj.port} db={url_obj.database} user={url_obj.username}"
-    )
-except Exception as e:
-    logger.error(f"DB_URL_CHECK parse failed: {e}")
-
-# -----------------------------
 # FastAPI app
 # -----------------------------
 app = FastAPI(title="Coxwell Supabase Read-only SQL API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten in production
+    allow_origins=["*"],   # tighten later if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -71,20 +53,14 @@ app.add_middleware(
 # -----------------------------
 # Rate limiting
 # -----------------------------
-def client_ip(request: Request) -> str:
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
-    return get_remote_address(request)
-
-limiter = Limiter(key_func=client_ip)
+limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 
 @app.exception_handler(RateLimitExceeded)
 async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
     return JSONResponse(
         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-        content={"detail": "Rate limit exceeded. Please try again later."}
+        content={"detail": "Rate limit exceeded. Please try again later."},
     )
 
 # -----------------------------
@@ -97,39 +73,20 @@ engine = create_engine(
 )
 
 # -----------------------------
-# Health endpoints
-# -----------------------------
-@app.get("/health")
-async def health():
-    return {"status": "ok", "service": "supabase-sql-api"}
-
-# TEMP DEBUG VERSION: returns real DB error in response
-@app.get("/dbcheck")
-async def dbcheck():
-    try:
-        with engine.connect() as conn:
-            val = conn.execute(text("SELECT 1")).scalar()
-        return {"db": "ok", "result": val}
-    except Exception as e:
-        logger.exception("DB health check failed")
-        # TEMP: show real reason in browser (remove after fix)
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {repr(e)}")
-
-# -----------------------------
-# Safety: allow ONLY SELECT
+# Safety: allow ONLY SELECT, single statement, block dangerous keywords
 # -----------------------------
 DANGEROUS = re.compile(
     r"\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|vacuum|analyze)\b",
-    re.IGNORECASE
+    re.IGNORECASE,
 )
 
 AGG_HINT = re.compile(
     r"\b(group\s+by|having|count\s*\(|sum\s*\(|avg\s*\(|min\s*\(|max\s*\()\b",
-    re.IGNORECASE
+    re.IGNORECASE,
 )
 
 def is_select_only(sql: str) -> bool:
-    s = sql.strip()
+    s = (sql or "").strip()
     if not s.lower().startswith("select"):
         return False
     # block multi-statement; allow a single trailing ';'
@@ -140,15 +97,39 @@ def is_select_only(sql: str) -> bool:
     return True
 
 def add_limit_if_needed(sql: str, limit: int = 100) -> str:
-    s = sql.strip().rstrip(";")
+    s = (sql or "").strip().rstrip(";")
+
+    # don't force LIMIT on aggregations
     if AGG_HINT.search(s):
         return s
+
+    # already has LIMIT
     if re.search(r"\blimit\b", s, flags=re.IGNORECASE):
         return s
+
     return f"{s} LIMIT {limit}"
 
 # -----------------------------
-# Main SQL endpoint
+# Health endpoints
+# -----------------------------
+@app.get("/health")
+async def health() -> Dict[str, str]:
+    return {"status": "ok", "service": "supabase-sql-api"}
+
+@app.get("/dbcheck")
+async def dbcheck() -> Dict[str, Any]:
+    try:
+        with engine.connect() as conn:
+            # 🔒 Enforce DB-level read-only for this session
+            conn.exec_driver_sql("SET default_transaction_read_only = on")
+            val = conn.execute(text("SELECT 1")).scalar()
+        return {"db": "ok", "result": int(val)}
+    except Exception as e:
+        logger.exception("DB health check failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# -----------------------------
+# Main endpoint
 # -----------------------------
 @app.get("/sqlquery_alchemy/")
 @limiter.limit(RATE_LIMIT)
@@ -157,22 +138,29 @@ async def sqlquery_alchemy(sqlquery: str, api_key: str, request: Request) -> Any
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     if not is_select_only(sqlquery):
-        raise HTTPException(status_code=400, detail="Only single-statement SELECT queries are allowed.")
+        raise HTTPException(
+            status_code=400,
+            detail="Only single-statement SELECT queries are allowed.",
+        )
 
     safe_sql = add_limit_if_needed(sqlquery, limit=100)
     logger.info(f"Query: {safe_sql}")
 
     try:
         with engine.connect() as conn:
+            # 🔒 Enforce DB-level read-only for this session
+            conn.exec_driver_sql("SET default_transaction_read_only = on")
+
             result = conn.execute(text(safe_sql))
             rows = result.fetchall()
             cols = list(result.keys())
 
-        return [dict(zip(cols, row)) for row in rows]
+        data: List[Dict[str, Any]] = [dict(zip(cols, row)) for row in rows]
+        return data
 
-    except SQLAlchemyError:
+    except SQLAlchemyError as e:
         logger.exception("Database error")
-        raise HTTPException(status_code=500, detail="Database error")
-    except Exception:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    except Exception as e:
         logger.exception("Unexpected error")
-        raise HTTPException(status_code=500, detail="Unexpected error")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
