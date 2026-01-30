@@ -4,9 +4,10 @@ import time
 import logging
 from typing import Any, List, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Request, status, Query
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -25,31 +26,22 @@ logging.basicConfig(
 logger = logging.getLogger("supabase-api")
 
 # -----------------------------
-# Env vars (Render injects these)
+# Env vars
 # -----------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 REX_API_KEY = os.getenv("REX_API_KEY", "")
 RATE_LIMIT = os.getenv("RATE_LIMIT", "100/hour")
 
-# Query safety knobs
-DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "100"))
-MAX_LIMIT = int(os.getenv("MAX_LIMIT", "500"))
+DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "50"))
+MAX_LIMIT = int(os.getenv("MAX_LIMIT", "200"))
 
-# Timeouts (ms)
-STATEMENT_TIMEOUT_MS = int(os.getenv("STATEMENT_TIMEOUT_MS", "8000"))  # 8s
-IDLE_TX_TIMEOUT_MS = int(os.getenv("IDLE_TX_TIMEOUT_MS", "8000"))      # 8s
-
-# Optional: tighten CORS later
-ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*").split(",")
+STATEMENT_TIMEOUT_MS = int(os.getenv("STATEMENT_TIMEOUT_MS", "8000"))
+IDLE_TX_TIMEOUT_MS = int(os.getenv("IDLE_TX_TIMEOUT_MS", "8000"))
 
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL environment variable is required")
 if not REX_API_KEY:
     raise ValueError("REX_API_KEY environment variable is required")
-
-logger.info(f"Rate limit: {RATE_LIMIT}")
-logger.info(f"DEFAULT_LIMIT={DEFAULT_LIMIT}, MAX_LIMIT={MAX_LIMIT}")
-logger.info(f"STATEMENT_TIMEOUT_MS={STATEMENT_TIMEOUT_MS}, IDLE_TX_TIMEOUT_MS={IDLE_TX_TIMEOUT_MS}")
 
 # -----------------------------
 # FastAPI app
@@ -58,7 +50,7 @@ app = FastAPI(title="Coxwell Supabase Read-only SQL API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS if ALLOW_ORIGINS != ["*"] else ["*"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -70,7 +62,6 @@ app.add_middleware(
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 
-
 @app.exception_handler(RateLimitExceeded)
 async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
     return JSONResponse(
@@ -79,7 +70,7 @@ async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded) ->
     )
 
 # -----------------------------
-# DB Engine (pooler-friendly)
+# DB Engine
 # -----------------------------
 engine = create_engine(
     DATABASE_URL,
@@ -87,77 +78,10 @@ engine = create_engine(
     pool_recycle=300,
 )
 
-# -----------------------------
-# SQL Safety Rules
-# -----------------------------
-# Disallow any write/DDL keywords
-DANGEROUS = re.compile(
-    r"\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|vacuum|analyze)\b",
-    re.IGNORECASE,
-)
-
-# SELECT-only but still dangerous patterns
-BAD_SELECT = re.compile(
-    r"\b(pg_sleep|for\s+update|for\s+share|copy)\b",
-    re.IGNORECASE,
-)
-
-# Prevent "SELECT INTO new_table" (table creation)
-SELECT_INTO = re.compile(
-    r"\bselect\b[\s\S]*\binto\b",
-    re.IGNORECASE,
-)
-
-# Optional: block CTEs (WITH) - safer for public endpoints
-BLOCK_WITH = re.compile(
-    r"^\s*with\b",
-    re.IGNORECASE,
-)
-
-# Used to detect aggregations (to avoid forcing LIMIT)
-AGG_HINT = re.compile(
-    r"\b(group\s+by|having|count\s*\(|sum\s*\(|avg\s*\(|min\s*\(|max\s*\()\b",
-    re.IGNORECASE,
-)
-
-def is_single_statement(sql: str) -> bool:
-    """
-    Allow a single statement, optionally ending with ';'
-    Block 'SELECT 1; SELECT 2' type patterns.
-    """
-    s = (sql or "").strip()
-    if not s:
-        return False
-    # If semicolon exists anywhere except possibly the last char, treat as multi-statement
-    if ";" in s[:-1]:
-        return False
-    return True
-
-def is_select_only(sql: str) -> bool:
-    s = (sql or "").strip()
-
-    # Only allow SELECT (start with select)
-    if not s.lower().startswith("select"):
-        return False
-
-    if not is_single_statement(s):
-        return False
-
-    if DANGEROUS.search(s):
-        return False
-
-    if BAD_SELECT.search(s):
-        return False
-
-    if SELECT_INTO.search(s):
-        return False
-
-    # Optional extra-hardening: block WITH queries
-    # If you want to allow WITH, remove this check.
-    if BLOCK_WITH.search(s):
-        return False
-
-    return True
+def apply_session_safety(conn) -> None:
+    conn.exec_driver_sql("SET default_transaction_read_only = on")
+    conn.exec_driver_sql(f"SET statement_timeout = '{STATEMENT_TIMEOUT_MS}'")
+    conn.exec_driver_sql(f"SET idle_in_transaction_session_timeout = '{IDLE_TX_TIMEOUT_MS}'")
 
 def clamp_limit(user_limit: Optional[int]) -> int:
     if user_limit is None:
@@ -168,98 +92,166 @@ def clamp_limit(user_limit: Optional[int]) -> int:
         return MAX_LIMIT
     return user_limit
 
-def add_limit(sql: str, limit: int) -> str:
-    """
-    Force a LIMIT unless:
-    - query looks like aggregation
-    - already has LIMIT
-    """
-    s = (sql or "").strip().rstrip(";")
-
-    # Don't force LIMIT on aggregations (your rule)
-    if AGG_HINT.search(s):
-        return s
-
-    # Already has LIMIT
-    if re.search(r"\blimit\b", s, flags=re.IGNORECASE):
-        return s
-
-    return f"{s} LIMIT {limit}"
-
-def apply_session_safety(conn) -> None:
-    """
-    Enforce read-only + timeouts at DB-session level.
-    """
-    conn.exec_driver_sql("SET default_transaction_read_only = on")
-    conn.exec_driver_sql(f"SET statement_timeout = '{STATEMENT_TIMEOUT_MS}'")
-    conn.exec_driver_sql(f"SET idle_in_transaction_session_timeout = '{IDLE_TX_TIMEOUT_MS}'")
-
-def mask_key(key: str) -> str:
-    if not key:
-        return ""
-    if len(key) <= 8:
-        return "****"
-    return key[:4] + "****" + key[-4:]
-
-
 # -----------------------------
-# Health endpoint (use this for Render health check)
+# Health endpoints
 # -----------------------------
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"status": "ok", "service": "supabase-sql-api"}
 
+# -----------------------------
+# EXISTING SQL endpoint (optional keep)
+# -----------------------------
+DANGEROUS = re.compile(
+    r"\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|vacuum|analyze)\b",
+    re.IGNORECASE,
+)
+BAD_SELECT = re.compile(r"\b(pg_sleep|for\s+update|for\s+share)\b", re.IGNORECASE)
 
-# -----------------------------
-# Main endpoint
-# -----------------------------
+def is_select_only(sql: str) -> bool:
+    s = (sql or "").strip()
+    if not s.lower().startswith("select"):
+        return False
+    if ";" in s[:-1]:
+        return False
+    if DANGEROUS.search(s):
+        return False
+    if BAD_SELECT.search(s):
+        return False
+    return True
+
 @app.get("/sqlquery_alchemy/")
 @limiter.limit(RATE_LIMIT)
-async def sqlquery_alchemy(
-    request: Request,
-    sqlquery: str = Query(..., description="PostgreSQL SELECT query only"),
-    api_key: str = Query(..., description="API key"),
-    limit: Optional[int] = Query(None, description="Optional row limit (capped)"),
-) -> Any:
-    # Auth
+async def sqlquery_alchemy(sqlquery: str, api_key: str, request: Request) -> Any:
     if api_key != REX_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
-
-    # SQL safety
     if not is_select_only(sqlquery):
-        raise HTTPException(
-            status_code=400,
-            detail="Only single-statement SELECT queries are allowed (no writes, no pg_sleep, no FOR UPDATE/SHARE, no COPY, no SELECT INTO, no WITH).",
-        )
-
-    final_limit = clamp_limit(limit)
-    safe_sql = add_limit(sqlquery, limit=final_limit)
-
-    client_ip = get_remote_address(request)
-    start = time.time()
-
-    logger.info(f"REQ IP={client_ip} key={mask_key(api_key)} limit={final_limit} sql={safe_sql[:300]}")
+        raise HTTPException(status_code=400, detail="Only single SELECT allowed")
 
     try:
         with engine.connect() as conn:
             apply_session_safety(conn)
+            result = conn.execute(text(sqlquery))
+            rows = result.fetchall()
+            cols = list(result.keys())
+        return [dict(zip(cols, row)) for row in rows]
+    except Exception:
+        logger.exception("sqlquery_alchemy failed")
+        raise HTTPException(status_code=500, detail="Database error")
 
-            result = conn.execute(text(safe_sql))
+# ============================================================
+# ✅ NEW: AI CONTRACT ENDPOINT (NO RAW SQL FROM AI)
+# ============================================================
+
+ALLOWED_VIEW = 'public.v_product_intelligence'
+ALLOWED_COLUMNS = ["id", "product_name", "thickness", "product_class", "color", "finish"]
+
+class AIQueryRequest(BaseModel):
+    question: str = Field(..., min_length=2)
+    api_key: str = Field(..., min_length=5)
+    limit: Optional[int] = None
+
+def extract_thickness_mm(q: str) -> Optional[int]:
+    # finds 25mm, 25 mm, thickness 25, etc.
+    m = re.search(r"(\d{1,2})\s*mm", q.lower())
+    if m:
+        return int(m.group(1))
+    # also allow: "25 mm thickness" without mm? (optional)
+    m2 = re.search(r"\bthickness\s*(\d{1,2})\b", q.lower())
+    if m2:
+        return int(m2.group(1))
+    return None
+
+def extract_product_class(q: str) -> Optional[str]:
+    s = q.lower()
+    # map common words to your product_class values
+    mapping = {
+        "multicell": "Multicell Polycarbonate",
+        "multiwall": "Multiwall Polycarbonate",
+        "solid": "Solid Polycarbonate",
+        "corrugated": "Corrugated Polycarbonate",
+    }
+    for key, val in mapping.items():
+        if key in s:
+            return val
+    return None
+
+def extract_color_keyword(q: str) -> Optional[str]:
+    # simple: if user says "opal" or "bronze" or "clear"
+    s = q.lower()
+    for c in ["opal", "bronze", "clear", "blue", "green", "grey", "smoke"]:
+        if c in s:
+            return c
+    return None
+
+def build_safe_product_sql(question: str, limit: int) -> (str, Dict[str, Any]):
+    """
+    Builds SQL ONLY from allowed view + allowed columns + allowed filters.
+    """
+    filters = []
+    params: Dict[str, Any] = {"limit": limit}
+
+    thickness = extract_thickness_mm(question)
+    if thickness is not None:
+        filters.append("thickness = :thickness")
+        params["thickness"] = thickness
+
+    pclass = extract_product_class(question)
+    if pclass is not None:
+        filters.append("product_class = :product_class")
+        params["product_class"] = pclass
+
+    color_kw = extract_color_keyword(question)
+    if color_kw is not None:
+        # color column seems like text, so we do ILIKE match
+        filters.append("color ILIKE :color")
+        params["color"] = f"%{color_kw}%"
+
+    # generic keyword search in product_name (only if nothing else found)
+    # (keeps it useful)
+    if thickness is None and pclass is None and color_kw is None:
+        filters.append("product_name ILIKE :kw")
+        params["kw"] = f"%{question.strip()}%"
+
+    where_clause = ""
+    if filters:
+        where_clause = "WHERE " + " AND ".join(filters)
+
+    cols = ", ".join(ALLOWED_COLUMNS)
+    sql = f"""
+    SELECT {cols}
+    FROM {ALLOWED_VIEW}
+    {where_clause}
+    ORDER BY thickness NULLS LAST, product_name
+    LIMIT :limit
+    """
+    return sql, params
+
+@app.post("/ai_query")
+@limiter.limit(RATE_LIMIT)
+async def ai_query(payload: AIQueryRequest, request: Request) -> Any:
+    # Auth
+    if payload.api_key != REX_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    final_limit = clamp_limit(payload.limit)
+
+    sql, params = build_safe_product_sql(payload.question, final_limit)
+
+    logger.info(f"AI_QUERY ip={get_remote_address(request)} q='{payload.question[:120]}' limit={final_limit}")
+
+    try:
+        with engine.connect() as conn:
+            apply_session_safety(conn)
+            result = conn.execute(text(sql), params)
             rows = result.fetchall()
             cols = list(result.keys())
 
-        duration_ms = int((time.time() - start) * 1000)
-        logger.info(f"OK  IP={client_ip} ms={duration_ms} rows={len(rows)}")
-
-        data: List[Dict[str, Any]] = [dict(zip(cols, row)) for row in rows]
-        return data
+        return [dict(zip(cols, row)) for row in rows]
 
     except SQLAlchemyError:
-        duration_ms = int((time.time() - start) * 1000)
-        logger.exception(f"DB_ERROR IP={client_ip} ms={duration_ms}")
+        logger.exception("AI query DB error")
         raise HTTPException(status_code=500, detail="Database error")
-
     except Exception:
-        duration_ms = int((time.time() - start) * 1000)
-        logger.exception(f"UNEXPECTED_ERROR IP={client_ip} ms={duration_ms}")
+        logger.exception("AI query unexpected error")
         raise HTTPException(status_code=500, detail="Unexpected error")
