@@ -3,7 +3,7 @@ import re
 import logging
 from typing import Any, List, Dict
 
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Request, status, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -116,8 +116,16 @@ def add_limit_if_needed(sql: str, limit: int = 100) -> str:
 async def health() -> Dict[str, str]:
     return {"status": "ok", "service": "supabase-sql-api"}
 
+# ✅ PROTECTED dbcheck (requires api_key)
 @app.get("/dbcheck")
-async def dbcheck() -> Dict[str, Any]:
+@limiter.limit(RATE_LIMIT)
+async def dbcheck(
+    request: Request,
+    api_key: str = Query(..., description="API key required"),
+) -> Dict[str, Any]:
+    if api_key != REX_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
     try:
         with engine.connect() as conn:
             # 🔒 Enforce DB-level read-only for this session
