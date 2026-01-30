@@ -2,7 +2,7 @@ import os
 import re
 import time
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
@@ -15,6 +15,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 
 # -----------------------------
@@ -62,10 +63,11 @@ app.add_middleware(
 )
 
 # -----------------------------
-# Rate limiting
+# Rate limiting (SlowAPI)
 # -----------------------------
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)  # ✅ IMPORTANT
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -93,8 +95,8 @@ def apply_session_safety(conn) -> None:
     - query timeouts
     """
     conn.exec_driver_sql("SET default_transaction_read_only = on")
-    conn.exec_driver_sql(f"SET statement_timeout = '{STATEMENT_TIMEOUT_MS}'")
-    conn.exec_driver_sql(f"SET idle_in_transaction_session_timeout = '{IDLE_TX_TIMEOUT_MS}'")
+    conn.exec_driver_sql(f"SET statement_timeout = '{STATEMENT_TIMEOUT_MS}ms'")  # ✅ add ms
+    conn.exec_driver_sql(f"SET idle_in_transaction_session_timeout = '{IDLE_TX_TIMEOUT_MS}ms'")  # ✅ add ms
 
 
 def clamp_limit(user_limit: Optional[int]) -> int:
@@ -116,7 +118,7 @@ def mask_key(k: str) -> str:
 
 
 # -----------------------------
-# Health endpoint (kept)
+# Health endpoint
 # -----------------------------
 @app.get("/health")
 async def health() -> Dict[str, str]:
@@ -124,7 +126,7 @@ async def health() -> Dict[str, str]:
 
 
 # -----------------------------
-# AI Query Contract (main)
+# AI Query Contract
 # -----------------------------
 class AIQueryRequest(BaseModel):
     api_key: str = Field(..., description="REX API key")
@@ -136,12 +138,10 @@ class AIQueryRequest(BaseModel):
     )
 
 
-def build_products_sql(question: str, limit: int) -> (str, Dict[str, Any]):
+def build_products_sql(question: str, limit: int) -> Tuple[str, Dict[str, Any]]:
     """
     Converts plain question -> safe SQL against ONLY:
       public.v_product_intelligence
-
-    We do NOT allow arbitrary SQL here.
     """
     q = (question or "").strip()
     if not q:
@@ -149,19 +149,13 @@ def build_products_sql(question: str, limit: int) -> (str, Dict[str, Any]):
 
     ql = q.lower()
 
-    # Extract thickness like "25mm", "25 mm", "25"
+    # Extract thickness like "25mm", "25 mm"
     thickness = None
     m = re.search(r"\b(\d{1,2})\s*mm\b", ql)
     if m:
         thickness = int(m.group(1))
-    else:
-        # allow "25 mm multicell" without mm? (optional)
-        m2 = re.search(r"\b(\d{1,2})\b", ql)
-        if m2 and any(word in ql for word in ["thickness", "mm"]):
-            thickness = int(m2.group(1))
 
-    # Keyword filters (safe LIKE)
-    # You can extend this later with more rules
+    # Keywords (safe LIKE)
     like_tokens: List[str] = []
     for w in ["multicell", "multiwall", "solid", "corrugated", "vivid", "snapwall", "prism", "standing seam"]:
         if w in ql:
@@ -184,7 +178,6 @@ def build_products_sql(question: str, limit: int) -> (str, Dict[str, Any]):
     where = []
     params: Dict[str, Any] = {"limit": limit}
 
-    # IMPORTANT: only this view/table
     sql = """
 SELECT id, product_name, thickness, product_class, color, finish
 FROM public.v_product_intelligence
@@ -195,8 +188,6 @@ FROM public.v_product_intelligence
         params["thickness"] = thickness
 
     if like_tokens:
-        # match on product_name OR product_class
-        # (use OR inside a grouped clause)
         ors = []
         for i, tok in enumerate(like_tokens):
             key = f"tok{i}"
@@ -212,11 +203,9 @@ FROM public.v_product_intelligence
         params["finish_tok"] = f"%{finish_token}%"
         where.append("LOWER(finish) LIKE :finish_tok")
 
-    # Generic fallback: if no structured matches, do a safe broad search
+    # Better fallback: if nothing detected, return top items (fast and safe)
     if not where:
-        # search words in product_name
-        params["q"] = f"%{ql[:80]}%"
-        where.append("LOWER(product_name) LIKE :q")
+        where.append("1=1")
 
     sql += " WHERE " + " AND ".join(where) + " ORDER BY thickness DESC, product_name ASC LIMIT :limit"
     return sql.strip(), params
@@ -225,7 +214,6 @@ FROM public.v_product_intelligence
 @app.post("/ai_query")
 @limiter.limit(RATE_LIMIT)
 async def ai_query(payload: AIQueryRequest, request: Request) -> Any:
-    # Auth
     if payload.api_key != REX_API_KEY:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
 
@@ -235,13 +223,12 @@ async def ai_query(payload: AIQueryRequest, request: Request) -> Any:
     if mode != "products":
         raise HTTPException(status_code=400, detail="Unsupported mode. Use mode='products'.")
 
-    # Build SAFE SQL (no raw SQL accepted from user/AI)
     sql, params = build_products_sql(payload.question, limit)
 
     client_ip = get_remote_address(request)
     start = time.time()
 
-    logger.info(f"AI_QUERY IP={client_ip} key={mask_key(payload.api_key)} mode={mode} sql={sql[:250]}")
+    logger.info(f"AI_QUERY IP={client_ip} key={mask_key(payload.api_key)} mode={mode}")
 
     try:
         with engine.connect() as conn:
@@ -251,15 +238,15 @@ async def ai_query(payload: AIQueryRequest, request: Request) -> Any:
             cols = list(result.keys())
 
         duration_ms = int((time.time() - start) * 1000)
-        logger.info(f"AI_QUERY OK IP={client_ip} ms={duration_ms} rows={len(rows)}")
-
         data: List[Dict[str, Any]] = [dict(zip(cols, row)) for row in rows]
 
         return {
             "mode": mode,
             "question": payload.question,
             "row_limit": limit,
+            "row_count": len(data),
             "rows": data,
+            "latency_ms": duration_ms
         }
 
     except SQLAlchemyError:
