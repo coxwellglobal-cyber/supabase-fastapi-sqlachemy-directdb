@@ -1,15 +1,14 @@
 import os
 import re
 import time
-import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from fastapi import FastAPI, HTTPException, Request, status, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, HttpUrl
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -19,14 +18,16 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
+from supabase import create_client
+
+# OpenAI (v1+)
+from openai import OpenAI
+
 
 # -----------------------------
 # Logging
 # -----------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("coxwell-ai-api")
 
 
@@ -37,28 +38,25 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 REX_API_KEY = os.getenv("REX_API_KEY", "").strip()
 RATE_LIMIT = os.getenv("RATE_LIMIT", "100/hour").strip()
 
-# Mixedbread + OpenAI for ingestion
-MIXEDBREAD_API_KEY = os.getenv("MIXEDBREAD_API_KEY", os.getenv("MIXEDBREAD_API_KEY".upper(), "")).strip()
-# (Some people set MIXEDBREAD_API_KEY, you showed MIXEDBREAD_API_KEY in Render. Good.)
+# Mixedbread / OpenAI / Supabase
+MIXEDBREAD_API_KEY = os.getenv("MIXEDBREAD_API_KEY", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-
-# If Mixedbread ever changes, you can override without code change:
-MIXEDBREAD_PARSE_URL = os.getenv("MIXEDBREAD_PARSE_URL", "https://api.mixedbread.com/v1/parse").strip()
-
-# Embedding model used for 1536 dims
-OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small").strip()
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
 # Safety knobs
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "50"))
 MAX_LIMIT = int(os.getenv("MAX_LIMIT", "100"))
 
 # DB timeouts (ms)
-STATEMENT_TIMEOUT_MS = int(os.getenv("STATEMENT_TIMEOUT_MS", "8000"))  # 8s
-IDLE_TX_TIMEOUT_MS = int(os.getenv("IDLE_TX_TIMEOUT_MS", "8000"))      # 8s
+STATEMENT_TIMEOUT_MS = int(os.getenv("STATEMENT_TIMEOUT_MS", "8000"))
+IDLE_TX_TIMEOUT_MS = int(os.getenv("IDLE_TX_TIMEOUT_MS", "8000"))
 
-# Chunking knobs
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1400"))   # chars
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
+# Ingestion knobs
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(25 * 1024 * 1024)))  # 25MB
+PARSING_POLL_SECONDS = int(os.getenv("PARSING_POLL_SECONDS", "45"))     # max wait
+PARSING_POLL_INTERVAL = float(os.getenv("PARSING_POLL_INTERVAL", "1.5"))
 
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL environment variable is required")
@@ -96,7 +94,7 @@ async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded) ->
 
 
 # -----------------------------
-# DB Engine
+# DB Engine (pooler-friendly)
 # -----------------------------
 engine = create_engine(
     DATABASE_URL,
@@ -105,43 +103,19 @@ engine = create_engine(
 )
 
 
-def apply_readonly_session_safety(conn) -> None:
-    """
-    Defense-in-depth for READ endpoints:
-    - force read-only
-    - set query timeouts
-    """
+def apply_session_safety(conn) -> None:
+    """Defense-in-depth: read-only + timeouts"""
     conn.exec_driver_sql("SET default_transaction_read_only = on")
     conn.exec_driver_sql(f"SET statement_timeout = '{STATEMENT_TIMEOUT_MS}ms'")
     conn.exec_driver_sql(f"SET idle_in_transaction_session_timeout = '{IDLE_TX_TIMEOUT_MS}ms'")
 
 
-def apply_write_session_safety(conn) -> None:
-    """
-    Safety for WRITE endpoints:
-    - do NOT set read-only
-    - still set timeouts
-    """
-    conn.exec_driver_sql(f"SET statement_timeout = '{STATEMENT_TIMEOUT_MS}ms'")
-    conn.exec_driver_sql(f"SET idle_in_transaction_session_timeout = '{IDLE_TX_TIMEOUT_MS}ms'")
-
-
 def clamp_limit(user_limit: Optional[int]) -> int:
-    if user_limit is None:
-        return DEFAULT_LIMIT
-    if user_limit < 1:
+    if user_limit is None or user_limit < 1:
         return DEFAULT_LIMIT
     if user_limit > MAX_LIMIT:
         return MAX_LIMIT
     return user_limit
-
-
-def mask_key(k: str) -> str:
-    if not k:
-        return ""
-    if len(k) <= 8:
-        return "****"
-    return k[:4] + "****" + k[-4:]
 
 
 # -----------------------------
@@ -159,21 +133,13 @@ class AIQueryRequest(BaseModel):
     api_key: str = Field(..., description="REX API key")
     question: str = Field(..., description="User question in plain English")
     limit: Optional[int] = Field(None, description="Optional row limit (capped)")
-    mode: Optional[str] = Field(
-        "products",
-        description="Supported: 'products' (queries v_product_intelligence)",
-    )
+    mode: Optional[str] = Field("products", description="Supported: 'products'")
 
 
 def build_products_sql(question: str, limit: int) -> Tuple[str, Dict[str, Any]]:
-    """
-    Converts plain question -> safe SQL against ONLY:
-      public.v_product_intelligence
-    """
     q = (question or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="question is required")
-
     ql = q.lower()
 
     thickness = None
@@ -246,27 +212,22 @@ async def ai_query(payload: AIQueryRequest, request: Request) -> Any:
 
     sql, params = build_products_sql(payload.question, limit)
 
-    client_ip = get_remote_address(request)
     start = time.time()
-    logger.info(f"AI_QUERY IP={client_ip} key={mask_key(payload.api_key)} mode={mode}")
-
     try:
         with engine.connect() as conn:
-            apply_readonly_session_safety(conn)
+            apply_session_safety(conn)
             result = conn.execute(text(sql), params)
             rows = result.fetchall()
             cols = list(result.keys())
 
-        duration_ms = int((time.time() - start) * 1000)
         data: List[Dict[str, Any]] = [dict(zip(cols, row)) for row in rows]
-
         return {
             "mode": mode,
             "question": payload.question,
             "row_limit": limit,
             "row_count": len(data),
             "rows": data,
-            "latency_ms": duration_ms
+            "latency_ms": int((time.time() - start) * 1000),
         }
 
     except SQLAlchemyError:
@@ -277,270 +238,192 @@ async def ai_query(payload: AIQueryRequest, request: Request) -> Any:
         raise HTTPException(status_code=500, detail="Unexpected error")
 
 
-# =========================================================
-# Ingestion helpers (Mixedbread parse -> chunk -> embed -> DB)
-# =========================================================
-
-def chunk_text(text_in: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
-    t = (text_in or "").strip()
-    if not t:
-        return []
-    chunks = []
-    i = 0
-    n = len(t)
-    while i < n:
-        j = min(i + chunk_size, n)
-        chunks.append(t[i:j])
-        if j == n:
-            break
-        i = max(0, j - overlap)
-    return chunks
-
-
-def openai_embed(texts: List[str]) -> List[List[float]]:
-    """
-    Uses OpenAI Embeddings via HTTP (no extra SDK needed).
-    """
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is required for ingestion")
-    if not texts:
-        return []
-
-    resp = requests.post(
-        "https://api.openai.com/v1/embeddings",
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": OPENAI_EMBED_MODEL,
-            "input": texts
-        },
-        timeout=60,
-    )
-
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"OpenAI embeddings failed: {resp.text}")
-
-    data = resp.json().get("data", [])
-    # keep same order
-    return [row["embedding"] for row in data]
-
-
-def vector_literal(vec: List[float]) -> str:
-    # pgvector accepts: '[1,2,3]'
-    return "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
-
-
-def mixedbread_parse_from_url(pdf_url: str) -> str:
-    """
-    Calls Mixedbread parse with a URL.
-    Mixedbread endpoint is configurable via MIXEDBREAD_PARSE_URL.
-    """
-    if not MIXEDBREAD_API_KEY:
-        raise HTTPException(status_code=500, detail="MIXEDBREAD_API_KEY is required for ingestion")
-
-    # IMPORTANT: https + correct endpoint (your earlier error showed http://api.mixedbread.com/v1/parsing)
-    resp = requests.post(
-        MIXEDBREAD_PARSE_URL,
-        headers={
-            "Authorization": f"Bearer {MIXEDBREAD_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "source": {"type": "url", "url": pdf_url},
-            "strategy": "fast"
-        },
-        timeout=90,
-    )
-
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Mixedbread parse failed: {resp.status_code} {resp.text}")
-
-    parsed = resp.json()
-
-    # Try common structures safely
-    if isinstance(parsed, dict):
-        if "text" in parsed and isinstance(parsed["text"], str):
-            return parsed["text"]
-
-        blocks = parsed.get("blocks") or parsed.get("content") or parsed.get("data") or []
-        if isinstance(blocks, list) and blocks:
-            parts = []
-            for b in blocks:
-                if isinstance(b, dict) and "text" in b and isinstance(b["text"], str):
-                    parts.append(b["text"])
-                elif isinstance(b, str):
-                    parts.append(b)
-            return "\n".join(parts).strip()
-
-    # fallback
-    return json.dumps(parsed)[:20000]
-
-
-def save_document_and_chunks(
-    title: str,
-    product_family: str,
-    tags: List[str],
-    source_url: Optional[str],
-    full_text: str
-) -> Dict[str, Any]:
-    """
-    Inserts into:
-      public.pi_documents
-      public.pi_document_chunks (with embedding vector)
-    """
-    chunks = chunk_text(full_text)
-    if not chunks:
-        raise HTTPException(status_code=400, detail="No text extracted to ingest")
-
-    embeddings = openai_embed(chunks)
-
-    if len(embeddings) != len(chunks):
-        raise HTTPException(status_code=500, detail="Embedding count mismatch")
-
-    try:
-        with engine.begin() as conn:
-            apply_write_session_safety(conn)
-
-            doc_row = conn.execute(
-                text("""
-                    INSERT INTO public.pi_documents (title, source_url, product_family, tags, meta)
-                    VALUES (:title, :source_url, :product_family, :tags, :meta)
-                    RETURNING id
-                """),
-                {
-                    "title": title,
-                    "source_url": source_url,
-                    "product_family": product_family,
-                    "tags": tags,
-                    "meta": {}
-                }
-            ).fetchone()
-
-            document_id = str(doc_row[0])
-
-            # Insert chunks
-            for idx, (c, emb) in enumerate(zip(chunks, embeddings), start=1):
-                conn.execute(
-                    text("""
-                        INSERT INTO public.pi_document_chunks
-                        (chunk_index, document_id, content, page_number, meta, embedding)
-                        VALUES (:chunk_index, :document_id, :content, :page_number, :meta, :embedding::vector)
-                    """),
-                    {
-                        "chunk_index": idx,
-                        "document_id": document_id,
-                        "content": c,
-                        "page_number": None,
-                        "meta": {},
-                        "embedding": vector_literal(emb),
-                    }
-                )
-
-        return {
-            "status": "success",
-            "document_id": document_id,
-            "chunks_inserted": len(chunks),
-        }
-
-    except SQLAlchemyError:
-        logger.exception("DB write failed")
-        raise HTTPException(status_code=500, detail="Database error during ingestion")
-    except Exception:
-        logger.exception("Unexpected ingestion error")
-        raise HTTPException(status_code=500, detail="Unexpected error during ingestion")
-
-
-# =========================================================
-# NEW ✅ Cloud-Agent friendly endpoint (JSON)
-# =========================================================
+# -----------------------------
+# NEW: Ingest PDF by URL (Cloud Agent friendly)
+# -----------------------------
 class IngestPdfUrlRequest(BaseModel):
     api_key: str
     title: str
     product_family: str
     tags: List[str] = Field(default_factory=list)
-    pdf_url: str
+    pdf_url: HttpUrl
+
+
+def _require_ingestion_env() -> None:
+    if not MIXEDBREAD_API_KEY:
+        raise HTTPException(status_code=500, detail="MIXEDBREAD_API_KEY is required for ingestion")
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is required for ingestion")
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=500, detail="SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for ingestion")
+
+
+def _download_pdf(pdf_url: str) -> bytes:
+    try:
+        r = requests.get(pdf_url, timeout=30, stream=True)
+        r.raise_for_status()
+
+        content_type = (r.headers.get("content-type") or "").lower()
+        if "pdf" not in content_type and not pdf_url.lower().endswith(".pdf"):
+            # still allow, but warn
+            logger.warning(f"PDF URL content-type not PDF: {content_type}")
+
+        data = r.content
+        if len(data) > MAX_PDF_BYTES:
+            raise HTTPException(status_code=400, detail=f"PDF too large (> {MAX_PDF_BYTES} bytes)")
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download pdf_url: {str(e)}")
+
+
+def _mixedbread_upload_file(filename: str, pdf_bytes: bytes) -> str:
+    # POST https://api.mixedbread.com/v1/files (multipart)
+    headers = {"Authorization": f"Bearer {MIXEDBREAD_API_KEY}"}
+    files = {"file": (filename, pdf_bytes, "application/pdf")}
+    resp = requests.post("https://api.mixedbread.com/v1/files", headers=headers, files=files, timeout=60)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Mixedbread upload failed: {resp.status_code} {resp.text}")
+    return resp.json()["id"]
+
+
+def _mixedbread_create_parse_job(file_id: str) -> str:
+    # POST https://api.mixedbread.com/v1/parsing/jobs
+    headers = {"Authorization": f"Bearer {MIXEDBREAD_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "file_id": file_id,
+        # Safe defaults
+        "chunking_strategy": "page",
+        "return_format": "markdown",
+    }
+    resp = requests.post("https://api.mixedbread.com/v1/parsing/jobs", headers=headers, json=payload, timeout=60)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Mixedbread create job failed: {resp.status_code} {resp.text}")
+    return resp.json()["id"]
+
+
+def _mixedbread_wait_for_result(job_id: str) -> Dict[str, Any]:
+    headers = {"Authorization": f"Bearer {MIXEDBREAD_API_KEY}"}
+    deadline = time.time() + PARSING_POLL_SECONDS
+
+    while time.time() < deadline:
+        resp = requests.get(f"https://api.mixedbread.com/v1/parsing/jobs/{job_id}", headers=headers, timeout=30)
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"Mixedbread job fetch failed: {resp.status_code} {resp.text}")
+
+        job = resp.json()
+        status_ = job.get("status")
+
+        if status_ == "completed":
+            return job
+        if status_ == "failed":
+            raise HTTPException(status_code=502, detail=f"Mixedbread parsing failed: {job.get('error')}")
+
+        time.sleep(PARSING_POLL_INTERVAL)
+
+    raise HTTPException(status_code=504, detail="Mixedbread parsing timed out")
+
+
+def _openai_embed(texts: List[str]) -> List[List[float]]:
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    # OpenAI embeddings API supports batching
+    res = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+    return [d.embedding for d in res.data]
+
+
+def _supabase_client():
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
 @app.post("/ingest_pdf_url")
 @limiter.limit(RATE_LIMIT)
 async def ingest_pdf_url(payload: IngestPdfUrlRequest, request: Request) -> Any:
     if payload.api_key != REX_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
 
-    if not payload.pdf_url.lower().startswith(("http://", "https://")):
-        raise HTTPException(status_code=400, detail="pdf_url must be a public http(s) URL")
+    _require_ingestion_env()
 
-    client_ip = get_remote_address(request)
-    logger.info(f"INGEST_PDF_URL IP={client_ip} key={mask_key(payload.api_key)} title={payload.title}")
+    # 1) Download PDF
+    pdf_bytes = _download_pdf(str(payload.pdf_url))
+    filename = f"{payload.title.strip().replace(' ', '_')}.pdf"
 
-    full_text = mixedbread_parse_from_url(payload.pdf_url)
+    # 2) Upload to Mixedbread + Parse
+    file_id = _mixedbread_upload_file(filename, pdf_bytes)
+    job_id = _mixedbread_create_parse_job(file_id)
+    job = _mixedbread_wait_for_result(job_id)
 
-    return save_document_and_chunks(
-        title=payload.title,
-        product_family=payload.product_family,
-        tags=payload.tags,
-        source_url=payload.pdf_url,
-        full_text=full_text
-    )
+    # Extract chunks
+    result = (job.get("result") or {})
+    chunks = result.get("chunks") or []
+    if not chunks:
+        raise HTTPException(status_code=502, detail="No chunks returned from Mixedbread parsing")
 
+    # 3) Prepare chunk texts
+    chunk_texts: List[str] = []
+    for c in chunks:
+        # prefer content_to_embed if available, else content
+        chunk_texts.append((c.get("content_to_embed") or c.get("content") or "").strip())
 
-# =========================================================
-# Existing file-upload endpoint (multipart)
-# NOTE: Cloud Agent often fails with file upload. Use /ingest_pdf_url instead.
-# =========================================================
-@app.post("/ingest_pdf_file")
-@limiter.limit(RATE_LIMIT)
-async def ingest_pdf_file(
-    request: Request,
-    api_key: str = Form(...),
-    title: str = Form(...),
-    product_family: str = Form(...),
-    tags: str = Form(""),
-    file: UploadFile = File(...)
-) -> Any:
-    if api_key != REX_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+    chunk_texts = [t for t in chunk_texts if t]
+    if not chunk_texts:
+        raise HTTPException(status_code=502, detail="Mixedbread returned empty chunk content")
 
-    if not MIXEDBREAD_API_KEY:
-        raise HTTPException(status_code=500, detail="MIXEDBREAD_API_KEY is required for ingestion")
+    # 4) Create embeddings (OpenAI)
+    embeddings: List[List[float]] = _openai_embed(chunk_texts)
 
-    # Parse tags from comma string
-    tag_list = [t.strip() for t in (tags or "").split(",") if t.strip()]
+    # 5) Insert into Supabase tables
+    sb = _supabase_client()
 
-    client_ip = get_remote_address(request)
-    logger.info(f"INGEST_PDF_FILE IP={client_ip} key={mask_key(api_key)} title={title} filename={file.filename}")
+    # Insert document
+    doc_payload = {
+        "title": payload.title,
+        "product_family": payload.product_family,
+        "tags": payload.tags,
+        "source_url": str(payload.pdf_url),
+        "mixedbread_file_id": file_id,
+        "mixedbread_job_id": job_id,
+    }
 
-    # Read file bytes
-    pdf_bytes = await file.read()
-    if not pdf_bytes:
-        raise HTTPException(status_code=400, detail="Empty file")
+    doc_res = sb.table("pi_documents").insert(doc_payload).execute()
+    if not doc_res.data:
+        raise HTTPException(status_code=500, detail="Failed to insert into pi_documents")
+    document_id = doc_res.data[0].get("id")
 
-    # Mixedbread parse (multipart)
-    # If Mixedbread expects a different file field name, change "file" here.
-    resp = requests.post(
-        MIXEDBREAD_PARSE_URL,
-        headers={"Authorization": f"Bearer {MIXEDBREAD_API_KEY}"},
-        files={"file": (file.filename or "document.pdf", pdf_bytes, file.content_type or "application/pdf")},
-        data={"strategy": "fast"},
-        timeout=120,
-    )
+    # Insert chunks
+    chunk_rows = []
+    for i, (text_, emb_) in enumerate(zip(chunk_texts, embeddings)):
+        chunk_rows.append(
+            {
+                "document_id": document_id,
+                "chunk_index": i,
+                "content": text_,
+                "embedding": emb_,  # may fail if your column name/type differs
+            }
+        )
 
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Mixedbread parse failed: {resp.status_code} {resp.text}")
+    # Try inserting with embeddings; if schema differs, retry without embeddings
+    try:
+        chunk_res = sb.table("pi_document_chunks").insert(chunk_rows).execute()
+        if not chunk_res.data:
+            raise HTTPException(status_code=500, detail="Failed to insert into pi_document_chunks")
+        inserted = len(chunk_res.data)
+    except Exception as e:
+        logger.warning(f"Chunk insert with embeddings failed, retrying without embeddings: {e}")
+        chunk_rows_no_emb = [
+            {k: v for k, v in row.items() if k != "embedding"} for row in chunk_rows
+        ]
+        chunk_res = sb.table("pi_document_chunks").insert(chunk_rows_no_emb).execute()
+        if not chunk_res.data:
+            raise HTTPException(status_code=500, detail="Failed to insert chunks (without embeddings)")
+        inserted = len(chunk_res.data)
 
-    parsed = resp.json()
-    if isinstance(parsed, dict) and "text" in parsed and isinstance(parsed["text"], str):
-        full_text = parsed["text"]
-    else:
-        blocks = parsed.get("blocks", []) if isinstance(parsed, dict) else []
-        full_text = "\n".join([b.get("text", "") for b in blocks if isinstance(b, dict)]).strip()
-
-    return save_document_and_chunks(
-        title=title,
-        product_family=product_family,
-        tags=tag_list,
-        source_url=None,
-        full_text=full_text
-    )
+    return {
+        "status": "ok",
+        "document_id": document_id,
+        "title": payload.title,
+        "chunks_parsed": len(chunk_texts),
+        "chunks_inserted": inserted,
+        "mixedbread_file_id": file_id,
+        "mixedbread_job_id": job_id,
+    }
