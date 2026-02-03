@@ -10,3 +10,5 @@ requests
 supabase
 openai
 python-multipart
+requests==2.32.3
+python-multipart==0.0.9
