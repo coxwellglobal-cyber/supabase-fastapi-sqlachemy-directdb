@@ -49,7 +49,7 @@ IDLE_TX_TIMEOUT_MS = int(os.getenv("IDLE_TX_TIMEOUT_MS", "8000"))      # 8s
 # NEW: Ingestion env vars (for Mixedbread + Supabase inserts)
 # -----------------------------
 MIXEDBREAD_API_KEY = os.getenv("MIXEDBREAD_API_KEY", "").strip()
-MIXEDBREAD_PARSE_URL = os.getenv("MIXEDBREAD_PARSE_URL", "https://api.mixedbread.com/v1/parsing").strip()
+MIXEDBREAD_PARSE_URL = os.getenv("MIXEDBREAD_PARSE_URL", "https://api.mixedbread.com/v1/parse").strip()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
